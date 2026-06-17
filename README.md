@@ -2,7 +2,7 @@
 
 A cross-platform desktop Text-to-Speech app with a Tkinter GUI.
 
-This project is "experimental" and not under active maintenance. As such, no support will be given
+This project is experimental and not under active maintenance. Issues and pull requests may not receive a response.
 
 - **Local voices** are driven by [`pyttsx3`](https://pyttsx3.readthedocs.io/) (offline; uses the operating system's built-in voices).
 - **Cloud voices** are provided by [ElevenLabs](https://elevenlabs.io/). Enter a valid API key and your account's voices appear in the same picker.
