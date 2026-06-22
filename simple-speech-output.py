@@ -11,13 +11,18 @@ import configparser
 import os
 import platform
 import queue
+import re
 import stat
 import subprocess
 import tempfile
 import threading
 import tkinter as tk
+import webbrowser
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from xml.etree import ElementTree as ET
 
 import pyttsx3
 
@@ -49,6 +54,407 @@ def save_api_key(api_key: str) -> None:
         os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     except OSError:
         pass  # best effort (e.g. Windows)
+
+
+# ── Document loading & formatting parser ──────────────────────────────────────
+#
+# Reads a user-chosen text, Markdown, or Word (.docx) file and produces an
+# *annotated reading*: the document's text with its formatting announced aloud,
+# so the listener hears headings, tables, bold/italic/coloured text, etc. — not
+# just the bare words. Parsing uses only the standard library, so there are no
+# extra dependencies to keep secure/up to date.
+#
+# Security model: untrusted files are validated before parsing.
+#   * Extension allow-list (defence in depth alongside the file dialog filter).
+#   * On-disk size cap, so a huge file can't exhaust memory.
+#   * .docx is a ZIP container, so we guard against zip bombs (entry count +
+#     total uncompressed size) and against XXE / "billion laughs" XML entity
+#     attacks (we refuse any DTD/entity declarations).
+#   * Decoded text is sanitised of control characters before it reaches TTS.
+
+ALLOWED_EXTS = {".txt", ".text", ".md", ".markdown", ".docx"}
+MAX_FILE_SIZE = 10 * 1024 * 1024          # 10 MB on disk
+MAX_UNCOMPRESSED = 50 * 1024 * 1024       # 50 MB after ZIP inflation
+MAX_ZIP_ENTRIES = 2000                    # sane upper bound for a .docx
+
+# WordprocessingML namespace used inside a .docx document.xml.
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+# Map common hex fill/font colours to spoken names; anything else is just
+# announced as "coloured" so the listener still knows the text was styled.
+_HEX_COLOURS = {
+    "ff0000": "red", "00ff00": "green", "008000": "green", "0000ff": "blue",
+    "ffff00": "yellow", "ffa500": "orange", "800080": "purple",
+    "ffc0cb": "pink", "a52a2a": "brown", "808080": "grey", "000000": "black",
+    "ffffff": "white", "00ffff": "cyan", "ff00ff": "magenta",
+}
+
+
+def _w(tag: str) -> str:
+    return f"{{{_W_NS}}}{tag}"
+
+
+class DocumentError(Exception):
+    """Raised when a chosen file is unsupported, unsafe, or unparseable."""
+
+
+@dataclass
+class ParsedDocument:
+    spoken_text: str            # annotated reading fed to the TTS engine
+    source: str = ""            # absolute path of the source file
+    kind: str = "text"          # text | markdown | docx
+
+
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _sanitize(text: str) -> str:
+    """Drop control characters (keep tab/newline) to protect downstream code."""
+    return "".join(
+        ch for ch in text
+        if ch in ("\n", "\t") or ord(ch) >= 32
+    )
+
+
+def _read_text_bytes(path: Path) -> str:
+    # Size is already capped by the caller; utf-8-sig strips any BOM.
+    return path.read_bytes().decode("utf-8-sig", errors="replace")
+
+
+def _colour_name(val: str | None) -> str | None:
+    """Spoken name for a hex colour value, or None for 'auto'/black/missing."""
+    if not val or val.lower() in ("auto", "000000"):
+        return None
+    return _HEX_COLOURS.get(val.lstrip("#").lower(), "coloured")
+
+
+# ── Markdown ──────────────────────────────────────────────────────────────────
+
+def _inline_md(text: str, announce: bool) -> str:
+    """Render inline Markdown to speech.
+
+    When *announce* is true the formatting is spoken alongside the text
+    (e.g. "bold important"); otherwise the markup is simply stripped.
+    """
+    if announce:
+        repl_image = lambda m: f" image {m.group(1)} " if m.group(1) else " image "
+        repl_link = lambda m: f" link {m.group(1)} "
+        repl_bold = lambda m: f" bold {m.group(2)} "
+        repl_italic = lambda m: f" italic {m.group(2)} "
+        repl_code = lambda m: f" code {m.group(1)} "
+    else:
+        repl_image = repl_link = repl_code = lambda m: m.group(1)
+        repl_bold = repl_italic = lambda m: m.group(2)
+
+    # Images: ![alt](url)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", repl_image, text)
+    # Links: [text](url)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", repl_link, text)
+    # Bold (** or __) before italic so the markers aren't half-consumed.
+    text = re.sub(r"(\*\*|__)(.+?)\1", repl_bold, text)
+    # Italic (* or _)
+    text = re.sub(r"(?<!\w)(\*|_)(?!\s)(.+?)(?<!\s)\1(?!\w)", repl_italic, text)
+    # Inline code
+    text = re.sub(r"`([^`]+)`", repl_code, text)
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)  # no space before punctuation
+    return text.strip()
+
+
+def _md_is_table_separator(line: str) -> bool:
+    return bool(re.match(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$", line))
+
+
+def _md_split_row(line: str) -> list[str]:
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|"):
+        line = line[:-1]
+    return [c.strip() for c in line.split("|")]
+
+
+def _parse_markdown(raw: str, announce: bool) -> str:
+    lines = _normalize_newlines(raw).split("\n")
+    out: list[str] = []
+    in_fence = False
+    fence_lang = ""
+    code: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        fence = re.match(r"^\s*(```|~~~)(.*)$", line)
+        if fence:
+            if not in_fence:
+                in_fence, fence_lang, code = True, fence.group(2).strip(), []
+            else:
+                if announce:
+                    out.append(f"Code block in {fence_lang}."
+                               if fence_lang else "Code block.")
+                out.extend(code)
+                if announce:
+                    out.append("End of code block.")
+                in_fence = False
+            i += 1
+            continue
+        if in_fence:
+            code.append(line)
+            i += 1
+            continue
+
+        # GFM pipe table: a row, then a |---|---| separator line.
+        if "|" in line and i + 1 < len(lines) and _md_is_table_separator(lines[i + 1]):
+            header = _md_split_row(line)
+            i += 2
+            rows = []
+            while i < len(lines) and lines[i].strip() and "|" in lines[i]:
+                rows.append(_md_split_row(lines[i]))
+                i += 1
+            if announce:
+                out.append(f"Table with {len(rows) + 1} rows "
+                           f"and {len(header)} columns.")
+                out.append("Header row: "
+                           + "; ".join(_inline_md(c, announce) for c in header) + ".")
+                for r, cells in enumerate(rows, start=1):
+                    out.append(f"Row {r}: "
+                               + "; ".join(_inline_md(c, announce) for c in cells)
+                               + ".")
+                out.append("End of table.")
+            else:
+                out.append(", ".join(_inline_md(c, announce) for c in header))
+                for cells in rows:
+                    out.append(", ".join(_inline_md(c, announce) for c in cells))
+            continue
+
+        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$", line)
+        if heading:
+            text = _inline_md(heading.group(2), announce)
+            if announce:
+                out.append(f"Heading level {len(heading.group(1))}. {text}.")
+            else:
+                out.append(text)
+            i += 1
+            continue
+
+        if re.match(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$", line):  # --- *** ___
+            i += 1  # thematic break: nothing to read
+            continue
+
+        quote = re.match(r"^\s*>\s?(.*)$", line)
+        if quote:
+            text = _inline_md(quote.group(1), announce)
+            out.append(f"Quote. {text}" if announce else text)
+            i += 1
+            continue
+
+        item = re.match(r"^\s*([-*+]|\d+[.)])\s+(.*)$", line)
+        if item:
+            marker, body_txt = item.group(1), _inline_md(item.group(2), announce)
+            if not announce:
+                out.append(body_txt)
+            elif marker[0].isdigit():
+                out.append(f"Item {marker.rstrip('.)')}. {body_txt}")
+            else:
+                out.append(f"Bullet. {body_txt}")
+            i += 1
+            continue
+
+        out.append(_inline_md(line, announce))
+        i += 1
+
+    return "\n".join(out)
+
+
+# ── Word (.docx) ──────────────────────────────────────────────────────────────
+
+def _docx_toggle(el) -> bool:
+    """True when a boolean run property (<w:b/>, <w:i/>, …) is actually on."""
+    if el is None:
+        return False
+    return (el.get(_w("val")) or "true") not in ("0", "false", "off")
+
+
+def _docx_paragraph_runs(para, announce: bool) -> str:
+    """Text for one paragraph, merging adjacent like-styled runs.
+
+    When *announce* is true, run-level formatting (bold/italic/underline/
+    colour/highlight) is spoken; otherwise only the words are returned.
+    """
+    if not announce:
+        return "".join(
+            t.text or "" for t in para.iter(_w("t"))
+        ).strip()
+
+    segments: list[tuple[tuple, str]] = []
+    cur_sig = None
+    cur_text: list[str] = []
+
+    for run in para.iter(_w("r")):
+        rtext = "".join(t.text or "" for t in run.iter(_w("t")))
+        if not rtext:
+            continue
+        rpr = run.find(_w("rPr"))
+        bold = italic = under = False
+        colour = highlight = None
+        if rpr is not None:
+            bold = _docx_toggle(rpr.find(_w("b")))
+            italic = _docx_toggle(rpr.find(_w("i")))
+            u = rpr.find(_w("u"))
+            under = u is not None and (u.get(_w("val")) or "single") != "none"
+            c = rpr.find(_w("color"))
+            if c is not None:
+                colour = _colour_name(c.get(_w("val")))
+            h = rpr.find(_w("highlight"))
+            if h is not None:
+                hv = h.get(_w("val"))
+                highlight = hv if hv and hv != "none" else None
+
+        sig = (bold, italic, under, colour, highlight)
+        if sig == cur_sig:
+            cur_text.append(rtext)
+        else:
+            if cur_text:
+                segments.append((cur_sig, "".join(cur_text)))
+            cur_sig, cur_text = sig, [rtext]
+    if cur_text:
+        segments.append((cur_sig, "".join(cur_text)))
+
+    parts: list[str] = []
+    for sig, txt in segments:
+        txt = txt.strip()
+        if not txt:
+            continue
+        bold, italic, under, colour, highlight = sig
+        pre = []
+        if bold:
+            pre.append("bold")
+        if italic:
+            pre.append("italic")
+        if under:
+            pre.append("underlined")
+        if colour:
+            pre.append(colour if colour == "coloured" else f"{colour} coloured")
+        if highlight:
+            pre.append(f"{highlight} highlighted")
+        parts.append(f"{' '.join(pre)} {txt}" if pre else txt)
+    return " ".join(parts).strip()
+
+
+def _docx_table(tbl, announce: bool) -> list[str]:
+    rows = []
+    ncols = 0
+    for tr in tbl.findall(_w("tr")):
+        cells = []
+        for tc in tr.findall(_w("tc")):
+            cell = " ".join(
+                t for t in
+                (_docx_paragraph_runs(p, announce) for p in tc.findall(_w("p")))
+                if t
+            )
+            cells.append(cell.strip())
+        ncols = max(ncols, len(cells))
+        rows.append(cells)
+
+    if not announce:
+        return [", ".join(cells) for cells in rows]
+
+    out = [f"Table with {len(rows)} rows and {ncols} columns."]
+    for idx, cells in enumerate(rows, start=1):
+        out.append(f"Row {idx}: " + "; ".join(cells) + ".")
+    out.append("End of table.")
+    return out
+
+
+def _parse_docx(path: Path, announce: bool) -> str:
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            if "word/document.xml" not in names:
+                raise DocumentError("This is not a valid Word (.docx) document.")
+            if len(names) > MAX_ZIP_ENTRIES:
+                raise DocumentError("Document has too many internal parts.")
+            if sum(info.file_size for info in z.infolist()) > MAX_UNCOMPRESSED:
+                raise DocumentError("Document expands too large to open safely.")
+            with z.open("word/document.xml") as f:
+                data = f.read(MAX_UNCOMPRESSED + 1)
+    except zipfile.BadZipFile:
+        raise DocumentError("This is not a valid Word (.docx) document.")
+
+    if len(data) > MAX_UNCOMPRESSED:
+        raise DocumentError("Document is too large to open safely.")
+    # A genuine document.xml has no DTD; refuse one to block XXE / entity bombs.
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        raise DocumentError("Document contains disallowed XML declarations.")
+
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        raise DocumentError("Could not parse the Word document.")
+
+    body = root.find(_w("body"))
+    if body is None:
+        return ""
+
+    out: list[str] = []
+    # Walk the body's direct children so paragraphs and tables stay in order.
+    for child in body:
+        if child.tag == _w("p"):
+            text = _docx_paragraph_runs(child, announce)
+            if not text:
+                continue
+            style = None
+            ppr = child.find(_w("pPr"))
+            if ppr is not None:
+                pstyle = ppr.find(_w("pStyle"))
+                if pstyle is not None:
+                    style = pstyle.get(_w("val"))
+            if announce and style and style.lower().startswith("heading"):
+                level = "".join(c for c in style if c.isdigit()) or "1"
+                out.append(f"Heading level {level}. {text}.")
+            else:
+                out.append(text)
+        elif child.tag == _w("tbl"):
+            out.extend(_docx_table(child, announce))
+
+    return "\n".join(out)
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def load_document(path_str: str, announce: bool = True) -> ParsedDocument:
+    """Validate, read, and parse a document. Raises DocumentError on any issue.
+
+    When *announce* is false the result is the document's plain text only; when
+    true the formatting is announced inline (headings, tables, bold, etc.).
+    """
+    try:
+        resolved = Path(path_str).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise DocumentError("File not found.")
+    if not resolved.is_file():
+        raise DocumentError("The chosen path is not a regular file.")
+
+    ext = resolved.suffix.lower()
+    if ext not in ALLOWED_EXTS:
+        raise DocumentError(
+            f"Unsupported file type '{ext or '(none)'}'. "
+            "Only .txt, .md/.markdown, and .docx files are allowed."
+        )
+    if resolved.stat().st_size > MAX_FILE_SIZE:
+        raise DocumentError("File is too large (10 MB limit).")
+
+    if ext == ".docx":
+        spoken, kind = _parse_docx(resolved, announce), "docx"
+    elif ext in (".md", ".markdown"):
+        spoken, kind = _parse_markdown(_read_text_bytes(resolved), announce), "markdown"
+    else:
+        spoken, kind = _read_text_bytes(resolved), "text"
+
+    spoken = _sanitize(_normalize_newlines(spoken)).strip()
+    return ParsedDocument(spoken_text=spoken, source=str(resolved), kind=kind)
 
 
 # ── Dedicated TTS worker thread (local / pyttsx3) ─────────────────────────────
@@ -213,6 +619,7 @@ class TTSApp(tk.Tk):
         # Unified voice list; each entry: {"provider", "id", "label"}
         self._voice_entries: list[dict] = []
         self._play_proc: subprocess.Popen | None = None  # active cloud playback
+        self._parsed: ParsedDocument | None = None  # last loaded document
 
         # Platform modifier: Command on macOS, Control elsewhere.
         self._is_mac = platform.system() == "Darwin"
@@ -271,6 +678,38 @@ class TTSApp(tk.Tk):
         self.text_box.bind("<ISO_Left_Tab>", self._focus_prev)  # X11 Shift+Tab
         self.text_box.bind("<Control-Tab>", lambda e: self.text_box.insert("insert", "\t") or "break")
         Tooltip(self.text_box, "Type or paste the text to speak. Tab moves to the next control.")
+
+        # ── Input document row ────────────────────────────────────────────────
+        doc_frame = tk.Frame(self)
+        doc_frame.pack(fill="x", **pad)
+
+        tk.Label(doc_frame, text="Document:", underline=0).pack(side="left")
+        self.doc_var = tk.StringVar(value="No file loaded.")
+
+        # Load button sits at the right; checkbox to its left; label fills middle.
+        self._make_button(
+            doc_frame, text="Load File…", command=self._open_document, underline=0,
+            tip=f"Open a text, Markdown, or Word file ({mod}L). Its text fills the "
+                "box, with formatting announced unless the checkbox is off.",
+        ).pack(side="right", padx=(8, 0))
+
+        self.announce_var = tk.BooleanVar(value=True)
+        self.announce_chk = tk.Checkbutton(
+            doc_frame, text="Announce formatting", variable=self.announce_var,
+            command=self._on_announce_toggle, underline=1,  # 'n' (Alt+N off-mac)
+            highlightthickness=2, highlightcolor="#1a73e8", takefocus=1,
+        )
+        self.announce_chk.pack(side="right", padx=(8, 0))
+        self.announce_chk.bind("<Return>", lambda _e: self.announce_chk.invoke())
+        Tooltip(self.announce_chk,
+                "When on, headings, tables, bold and coloured text are spoken "
+                "aloud as you read a loaded document. Turn off to read the plain "
+                "text only. Re-parses the current document immediately.")
+
+        tk.Label(
+            doc_frame, textvariable=self.doc_var, anchor="w", fg="gray40",
+            font=("Helvetica", 11),
+        ).pack(side="left", fill="x", expand=True, padx=(6, 6))
 
         # ── ElevenLabs connection row ─────────────────────────────────────────
         el = tk.Frame(self)
@@ -371,6 +810,11 @@ class TTSApp(tk.Tk):
         )
         self.status_label.pack(fill="x", side="bottom", ipady=3)
 
+        # Indeterminate progress bar shown only while an audio save is running
+        # (neither engine reports a percentage, so it just animates activity).
+        # Created now but not packed; _start/_stop_progress show/hide it.
+        self.progress = ttk.Progressbar(self, mode="indeterminate")
+
     # ── Accessible widget helpers ──────────────────────────────────────────────
 
     def _make_button(self, parent, *, tip: str = "", **kwargs) -> tk.Button:
@@ -416,6 +860,11 @@ class TTSApp(tk.Tk):
 
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(
+            label="Load Document…", command=self._open_document,
+            accelerator=self._accel("L"),
+        )
+        filemenu.add_separator()
+        filemenu.add_command(
             label="Choose Output File…", command=self._browse,
             accelerator=self._accel("O"),
         )
@@ -434,6 +883,9 @@ class TTSApp(tk.Tk):
             label="Keyboard Shortcuts", command=self._show_shortcuts,
             accelerator="F1",
         )
+        helpmenu.add_command(
+            label="Setting up ElevenLabs…", command=self._show_elevenlabs_help,
+        )
         menubar.add_cascade(label="Help", menu=helpmenu, underline=0)
 
         self.config(menu=menubar)
@@ -451,6 +903,7 @@ class TTSApp(tk.Tk):
         self.bind_all(f"<{m}-Return>", act(self._speak))
         self.bind_all(f"<{m}-s>", act(self._save))
         self.bind_all(f"<{m}-o>", act(self._browse))
+        self.bind_all(f"<{m}-l>", act(self._open_document))
         self.bind_all(f"<{m}-q>", act(self.destroy))
         # Focus jumps.
         self.bind_all(f"<{m}-e>", act(lambda: self.text_box.focus_set()))
@@ -470,6 +923,8 @@ class TTSApp(tk.Tk):
             self.bind_all("<Alt-s>", act(self._speak))
             self.bind_all("<Alt-p>", act(self._stop))
             self.bind_all("<Alt-o>", act(lambda: self.path_entry.focus_set()))
+            self.bind_all("<Alt-l>", act(self._open_document))
+            self.bind_all("<Alt-n>", act(lambda: self.announce_chk.invoke()))
             self.bind_all("<Alt-b>", act(self._browse))
             self.bind_all("<Alt-d>", act(self._save))  # saAve auDio
 
@@ -479,6 +934,7 @@ class TTSApp(tk.Tk):
             f"{m}Return\tSpeak the text",
             "Esc\tStop playback",
             f"{m}S\tSave audio to file",
+            f"{m}L\tLoad a document (text/Markdown/Word)",
             f"{m}O\tChoose output file",
             f"{m}E\tFocus the text box",
             f"{m}K\tFocus the API key field",
@@ -488,6 +944,85 @@ class TTSApp(tk.Tk):
             "F1\tShow this help",
         ]
         messagebox.showinfo("Keyboard Shortcuts", "\n".join(lines))
+
+    # ── ElevenLabs setup help ──────────────────────────────────────────────────
+
+    ELEVENLABS_KEYS_URL = "https://elevenlabs.io/app/settings/api-keys"
+
+    def _show_elevenlabs_help(self):
+        """Explain, in a dialog, how to get and use an ElevenLabs API key."""
+        body = (
+            "ElevenLabs gives you high-quality cloud voices. It is OPTIONAL — the "
+            "app already works offline with your computer's built-in voices, with "
+            "no account or internet needed.\n\n"
+            "To add ElevenLabs cloud voices:\n\n"
+            "1.  Go to elevenlabs.io and create a free account (or sign in).\n\n"
+            "2.  Verify your email address if prompted.\n\n"
+            "3.  Open your account menu (top-right) and choose \"API Keys\", or "
+            "go directly to:\n"
+            "        elevenlabs.io/app/settings/api-keys\n\n"
+            "4.  Click \"Create API Key\", give it any name, and copy the key. "
+            "It begins with \"sk_\".\n\n"
+            "5.  Back in this app, paste the key into the \"ElevenLabs API key\" "
+            "box and press Enter (or click Connect).\n\n"
+            "6.  Once the key is accepted, your account's voices appear in the "
+            "Voice list marked with a cloud symbol (☁). Pick one and press "
+            "Speak.\n\n"
+            "Good to know:\n"
+            "  •  The free plan includes a monthly character allowance.\n"
+            "  •  Your key is saved on this computer only (in your home "
+            "folder, readable by you alone) so you don't have to paste it again.\n"
+            "  •  Speaking rate applies to local voices only, not cloud voices."
+        )
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Setting up ElevenLabs")
+        dlg.transient(self)
+        dlg.resizable(True, True)
+        dlg.minsize(520, 460)
+
+        frame = tk.Frame(dlg)
+        frame.pack(fill="both", expand=True, padx=14, pady=12)
+
+        tk.Label(
+            frame, text="How to set up ElevenLabs cloud voices",
+            font=("Helvetica", 14, "bold"), anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        text_wrap = tk.Frame(frame)
+        text_wrap.pack(fill="both", expand=True)
+        txt = tk.Text(
+            text_wrap, wrap="word", font=("Helvetica", 12),
+            relief="flat", padx=6, pady=6, highlightthickness=2,
+            highlightcolor="#1a73e8",
+        )
+        sb = tk.Scrollbar(text_wrap, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        txt.insert("1.0", body)
+        txt.config(state="disabled")  # read-only, but still scrollable/selectable
+
+        btns = tk.Frame(frame)
+        btns.pack(fill="x", pady=(10, 0))
+
+        open_btn = self._make_button(
+            btns, text="Open ElevenLabs Website", underline=0,
+            command=lambda: webbrowser.open(self.ELEVENLABS_KEYS_URL),
+            tip="Open the ElevenLabs API keys page in your web browser.",
+        )
+        open_btn.pack(side="left")
+
+        close_btn = self._make_button(
+            btns, text="Close", underline=0, command=dlg.destroy,
+            tip="Close this help window (Esc).",
+        )
+        close_btn.pack(side="right")
+
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        # Make it modal and give the Close button initial keyboard focus.
+        dlg.grab_set()
+        close_btn.focus_set()
 
     # ── Voice list ─────────────────────────────────────────────────────────────
 
@@ -664,6 +1199,29 @@ class TTSApp(tk.Tk):
         if path:
             self.path_var.set(path)
 
+    def _estimate_save_seconds(self, text: str, entry: dict) -> float | None:
+        """Rough estimate of the save time, based on spoken-audio length.
+
+        Audio length ≈ words ÷ words-per-minute. For local voices we use the
+        chosen rate; cloud voices have no rate control, so assume ~150 wpm.
+        Returns None when there's nothing to estimate.
+        """
+        words = len(text.split())
+        if words == 0:
+            return None
+        rate = self.rate_var.get() if entry["provider"] == "local" else 150
+        return words / max(rate, 1) * 60.0
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        minutes, secs = divmod(int(round(seconds)), 60)
+        parts = []
+        if minutes:
+            parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        if secs or not minutes:
+            parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+        return " ".join(parts)
+
     def _save(self):
         text = self._get_text()
         if text is None:
@@ -677,7 +1235,23 @@ class TTSApp(tk.Tk):
             return
 
         entry = self._selected_entry()
+
+        # Always confirm the save, showing the estimated audio length.
+        est = self._estimate_save_seconds(text, entry)
+        length = (f"roughly {self._format_duration(est)} long"
+                  if est is not None else "of unknown length")
+        proceed = messagebox.askyesno(
+            "Save audio",
+            f"This audio is {length}, so saving it may take a little while.\n\n"
+            "Do you want to continue?",
+            default="yes",
+        )
+        if not proceed:
+            self.status_var.set("Save cancelled.")
+            return
+
         self.save_btn.config(state="disabled")
+        self._start_progress()
         self.status_var.set(f"Saving to {path}…")
 
         if entry["provider"] == "local":
@@ -701,6 +1275,50 @@ class TTSApp(tk.Tk):
             self.after(0, lambda: self._on_save_done(path))
         except Exception as exc:
             self.after(0, lambda: self._on_save_error(self._explain_cloud_error(exc)))
+
+    # ── Document loading / saving ──────────────────────────────────────────────
+
+    def _open_document(self):
+        """Let the user pick a text/Markdown/Word file, then load + parse it."""
+        path = filedialog.askopenfilename(
+            title="Load document…",
+            filetypes=[
+                ("Supported documents", "*.txt *.text *.md *.markdown *.docx"),
+                ("Text files", "*.txt *.text"),
+                ("Markdown files", "*.md *.markdown"),
+                ("Word documents", "*.docx"),
+            ],
+        )
+        if not path:
+            return
+        self._load_document_path(path)
+
+    def _on_announce_toggle(self):
+        """Re-parse the currently loaded document with the new announce setting."""
+        if self._parsed:
+            self._load_document_path(self._parsed.source)
+
+    def _load_document_path(self, path: str):
+        """Parse *path* (honouring the announce toggle) into the text box."""
+        announce = self.announce_var.get()
+        try:
+            doc = load_document(path, announce=announce)
+        except DocumentError as exc:
+            self.status_var.set("Could not load document.")
+            messagebox.showerror("Cannot open file", str(exc))
+            return
+        except Exception as exc:  # unexpected parser failure
+            self.status_var.set("Could not load document.")
+            messagebox.showerror("Cannot open file", f"Unexpected error:\n{exc}")
+            return
+
+        self._parsed = doc
+        self.text_box.delete("1.0", "end")
+        self.text_box.insert("1.0", doc.spoken_text)
+        name = Path(doc.source).name
+        self.doc_var.set(f"{name}  ({doc.kind})")
+        mode = "formatting announced" if announce else "plain text"
+        self.status_var.set(f"Loaded {name}: {mode}. Press Speak to read it.")
 
     # ── Cross-platform playback (for cloud audio bytes) ────────────────────────
 
@@ -748,14 +1366,26 @@ class TTSApp(tk.Tk):
         messagebox.showerror("Speak error", self._explain_cloud_error(exc))
 
     def _on_save_done(self, path: str):
+        self._stop_progress()
         self.save_btn.config(state="normal")
         self.status_var.set(f"Saved: {path}")
         messagebox.showinfo("Saved", f"Audio saved to:\n{path}")
 
     def _on_save_error(self, err: str):
+        self._stop_progress()
         self.save_btn.config(state="normal")
         self.status_var.set("Save failed.")
         messagebox.showerror("Save error", err)
+
+    # ── Save progress bar (indeterminate; runs while audio is written) ──────────
+
+    def _start_progress(self):
+        self.progress.pack(fill="x", side="bottom", padx=12, pady=(0, 4))
+        self.progress.start(12)  # animation step in ms
+
+    def _stop_progress(self):
+        self.progress.stop()
+        self.progress.pack_forget()
 
     def _set_busy(self, active: bool):
         self.speak_btn.config(state="disabled" if active else "normal")
