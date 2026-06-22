@@ -1,5 +1,7 @@
 # Text to Speech
 
+> **Note:** This project is not under active development. Development has been assisted by [Claude Code](https://claude.com/claude-code).
+
 A cross-platform desktop Text-to-Speech app with a Tkinter GUI.
 
 - **Local voices** are driven by [`pyttsx3`](https://pyttsx3.readthedocs.io/) (offline; uses the operating system's built-in voices).
