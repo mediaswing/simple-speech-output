@@ -79,6 +79,30 @@ python simple-speech-output.py
 
 The window opens with keyboard focus already in the text box, so you can start typing immediately.
 
+### Command-line (headless) mode
+
+Pass any argument and the app runs **without a GUI**, speaking (or saving) text or a document using the voice, rate, and formatting settings last chosen in the GUI (stored in the [configuration file](#configuration-file)):
+
+```bash
+# Speak some text aloud with your saved voice
+python simple-speech-output.py "Hello there"
+
+# Read a document (formatting announced unless --no-announce)
+python simple-speech-output.py --file report.docx --no-announce
+
+# Save to an audio file instead of playing it
+python simple-speech-output.py --file notes.md -o notes.wav
+
+# Pipe text in on standard input (note the trailing "-")
+echo "Piped text" | python simple-speech-output.py -
+
+# List the available voices, then pick one for this run
+python simple-speech-output.py --list-voices
+python simple-speech-output.py "Bonjour" --voice samantha --rate 190
+```
+
+Useful options: `-f/--file`, `-o/--output`, `-v/--voice` (id or partial name), `-r/--rate`, `--provider {local,cloud}`, `--announce`/`--no-announce`, and `--list-voices`. Cloud (`--provider cloud`) reuses the ElevenLabs API key saved by the GUI. Run with `--help` for the full list. Launching with **no arguments** always opens the GUI.
+
 ---
 
 ## Using the app
@@ -187,7 +211,7 @@ All actions are also reachable through the native **Speech / File / Help** menu 
 
 ## Configuration file
 
-The ElevenLabs API key is persisted in an INI file in your home directory:
+The ElevenLabs API key and your voice preferences are persisted in an INI file in your home directory:
 
 ```
 ~/.text-to-speech.ini        (Windows: C:\Users\<you>\.text-to-speech.ini)
@@ -196,14 +220,21 @@ The ElevenLabs API key is persisted in an INI file in your home directory:
 Format:
 
 ```ini
+[voice]
+provider = local        ; local | cloud
+id = com.apple.voice.compact.en-US.Samantha
+rate = 175              ; words per minute (local voices only)
+announce = true         ; announce document formatting when loading
+
 [elevenlabs]
 api_key = sk_your_key_here
 ```
 
-- The file is created automatically after a **successful** connection (an invalid key is never saved).
-- On POSIX systems it is written with `0600` permissions (owner read/write only).
-- On startup, a saved key is loaded and the app **auto-connects** so cloud voices are ready immediately.
-- To forget the key, delete the file or clear the `api_key` value.
+- The **`[voice]`** section is written whenever you change the voice, rate, or *Announce formatting* toggle in the GUI, and is restored on the next launch. Headless mode reads the same values (see [Command-line mode](#command-line-headless-mode)), so the CLI speaks in the voice you last used in the GUI.
+- The **`[elevenlabs]`** section is created automatically after a **successful** connection (an invalid key is never saved).
+- On POSIX systems the file is written with `0600` permissions (owner read/write only).
+- On startup, a saved key is loaded and the app **auto-connects** so cloud voices are ready immediately; a saved cloud voice is re-selected once the account's voices finish loading.
+- To reset, delete the file or clear the value you want to forget.
 
 ---
 
