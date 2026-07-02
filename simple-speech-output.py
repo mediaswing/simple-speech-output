@@ -1718,7 +1718,11 @@ def _speak_local(engine, text: str, voice_id: str, rate: int,
 
 def _speak_cloud(text: str, voice_id: str, output: str | None,
                  cloud: CloudTTS) -> int:
-    audio = cloud.synthesize(text, voice_id, "mp3_44100_128")
+    # Match the container to the output extension, like the GUI's save path:
+    # a .wav name gets WAV audio, everything else gets MP3.
+    fmt = ("wav_44100" if output and output.lower().endswith(".wav")
+           else "mp3_44100_128")
+    audio = cloud.synthesize(text, voice_id, fmt)
     if output:
         Path(output).write_bytes(audio)
         return 0
@@ -1757,6 +1761,9 @@ def run_headless(argv: list[str]) -> int:
         return 2
 
     if provider == "cloud":
+        if args.rate is not None:
+            print("Note: --rate applies to local voices only; ignoring it for "
+                  "the cloud voice.", file=sys.stderr)
         key = load_api_key()
         if not key:
             print("Error: no ElevenLabs API key saved. Connect once in the "
