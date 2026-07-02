@@ -1,5 +1,7 @@
 # Text to Speech
 
+[![Latest release](https://img.shields.io/github/v/release/mediaswing/simple-speech-output?label=release)](https://github.com/mediaswing/simple-speech-output/releases/latest)
+
 > **Note:** This project is not under active development. Development has been assisted by [Claude Code](https://claude.com/claude-code).
 
 A cross-platform desktop Text-to-Speech app with a Tkinter GUI.
