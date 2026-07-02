@@ -7,6 +7,7 @@ API key, that account's cloud voices become available in the same picker.
 
 from __future__ import annotations
 
+import argparse
 import configparser
 import os
 import platform
@@ -14,6 +15,7 @@ import queue
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -31,29 +33,85 @@ import pyttsx3
 CONFIG_PATH = Path.home() / ".text-to-speech.ini"
 
 
-def load_api_key() -> str:
-    """Return the saved ElevenLabs API key, or "" if none is stored."""
+def _read_config() -> configparser.ConfigParser:
+    """Load the INI file, returning an empty parser if it's missing/unreadable."""
     parser = configparser.ConfigParser()
     try:
         parser.read(CONFIG_PATH)
     except (OSError, configparser.Error):
-        return ""
-    return parser.get("elevenlabs", "api_key", fallback="").strip()
+        pass
+    return parser
 
 
-def save_api_key(api_key: str) -> None:
-    """Persist the ElevenLabs API key to the INI file (owner-only perms)."""
-    parser = configparser.ConfigParser()
-    parser.read(CONFIG_PATH)  # preserve any other sections
-    if not parser.has_section("elevenlabs"):
-        parser.add_section("elevenlabs")
-    parser.set("elevenlabs", "api_key", api_key.strip())
+def _write_config(parser: configparser.ConfigParser) -> None:
+    """Write the INI file back with owner-only (0600) permissions."""
     with open(CONFIG_PATH, "w") as f:
         parser.write(f)
     try:
         os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     except OSError:
         pass  # best effort (e.g. Windows)
+
+
+def load_api_key() -> str:
+    """Return the saved ElevenLabs API key, or "" if none is stored."""
+    return _read_config().get("elevenlabs", "api_key", fallback="").strip()
+
+
+def save_api_key(api_key: str) -> None:
+    """Persist the ElevenLabs API key to the INI file (owner-only perms)."""
+    parser = _read_config()  # preserve any other sections
+    if not parser.has_section("elevenlabs"):
+        parser.add_section("elevenlabs")
+    parser.set("elevenlabs", "api_key", api_key.strip())
+    _write_config(parser)
+
+
+# Speaking-rate bounds mirror the GUI spinbox; used to clamp restored values.
+MIN_RATE, MAX_RATE = 60, 500
+DEFAULT_RATE = 175
+
+
+@dataclass
+class VoiceSettings:
+    """The voice preferences shared between the GUI and headless mode."""
+    provider: str = "local"      # local | cloud
+    voice_id: str = ""           # pyttsx3 voice id or ElevenLabs voice_id
+    rate: int = DEFAULT_RATE     # words per minute (local voices only)
+    announce: bool = True        # announce document formatting when loading
+
+
+def load_voice_settings() -> VoiceSettings:
+    """Return the saved voice preferences, falling back to sane defaults."""
+    parser = _read_config()
+    s = VoiceSettings()
+    if not parser.has_section("voice"):
+        return s
+    provider = parser.get("voice", "provider", fallback=s.provider).strip().lower()
+    s.provider = provider if provider in ("local", "cloud") else "local"
+    s.voice_id = parser.get("voice", "id", fallback="").strip()
+    try:
+        s.rate = parser.getint("voice", "rate", fallback=s.rate)
+    except ValueError:
+        s.rate = DEFAULT_RATE
+    s.rate = max(MIN_RATE, min(MAX_RATE, s.rate))
+    try:
+        s.announce = parser.getboolean("voice", "announce", fallback=s.announce)
+    except ValueError:
+        s.announce = True
+    return s
+
+
+def save_voice_settings(s: VoiceSettings) -> None:
+    """Persist the voice preferences to the INI file (owner-only perms)."""
+    parser = _read_config()  # preserve any other sections
+    if not parser.has_section("voice"):
+        parser.add_section("voice")
+    parser.set("voice", "provider", s.provider)
+    parser.set("voice", "id", s.voice_id)
+    parser.set("voice", "rate", str(s.rate))
+    parser.set("voice", "announce", "true" if s.announce else "false")
+    _write_config(parser)
 
 
 # ── Document loading & formatting parser ──────────────────────────────────────
@@ -601,6 +659,40 @@ class CloudTTS:
         return b"".join(chunks)
 
 
+# ── Cross-platform audio playback ─────────────────────────────────────────────
+
+def _audio_play_command(path: str) -> list[str] | None:
+    """Return a blocking playback command for *path*.
+
+    Returns None on Windows, where the caller should use os.startfile (the
+    default association handles playback). Raises RuntimeError on Linux when
+    no supported player is installed.
+    """
+    system = platform.system()
+    if system == "Darwin":
+        return ["afplay", path]
+    if system == "Windows":
+        return None
+    from shutil import which
+    player = next(
+        (c for c in ("ffplay", "mpv", "cvlc", "xdg-open") if which(c)), None
+    )
+    if player is None:
+        raise RuntimeError("No audio player found (install ffplay, mpv or vlc).")
+    if player == "ffplay":
+        return [player, "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+    return [player, path]
+
+
+def _play_audio_blocking(path: str) -> None:
+    """Play an audio file and block until it finishes (used by headless mode)."""
+    cmd = _audio_play_command(path)
+    if cmd is None:
+        os.startfile(path)  # type: ignore[attr-defined]  # Windows
+        return
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ── Tooltip / accessible description ──────────────────────────────────────────
 
 class Tooltip:
@@ -665,6 +757,14 @@ class TTSApp(tk.Tk):
         self._build_ui()
         self._build_menu()
         self._bind_shortcuts()
+
+        # Restore saved voice preferences. Rate and the announce toggle apply
+        # immediately; the voice choice waits until the voice list is loaded
+        # (and, for a cloud voice, until ElevenLabs has connected).
+        saved = load_voice_settings()
+        self.rate_var.set(saved.rate)
+        self.announce_var.set(saved.announce)
+        self._pending_voice: VoiceSettings | None = saved
 
         # Start keyboard focus in the text box so typing works immediately.
         self.text_box.focus_set()
@@ -779,19 +879,23 @@ class TTSApp(tk.Tk):
             ctrl, textvariable=self.voice_var, state="readonly", width=34
         )
         self.voice_combo.grid(row=0, column=1, sticky="w", padx=(6, 20))
-        self.voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
+        self.voice_combo.bind("<<ComboboxSelected>>", self._on_voice_selected)
         Tooltip(self.voice_combo,
                 "Choose a voice. ☁ marks ElevenLabs cloud voices. "
                 "Use arrow keys to change selection.")
 
         tk.Label(ctrl, text="Rate (wpm):", underline=0).grid(row=0, column=2, sticky="w")
-        self.rate_var = tk.IntVar(value=175)
+        self.rate_var = tk.IntVar(value=DEFAULT_RATE)
         self.rate_spin = tk.Spinbox(
-            ctrl, from_=60, to=500, increment=10,
+            ctrl, from_=MIN_RATE, to=MAX_RATE, increment=10,
             textvariable=self.rate_var, width=6,
             highlightthickness=2, highlightcolor="#1a73e8",
+            command=self._persist_settings,  # fires on the up/down arrows
         )
         self.rate_spin.grid(row=0, column=3, sticky="w", padx=6)
+        # Persist a typed rate when the field loses focus or Enter is pressed.
+        self.rate_spin.bind("<FocusOut>", self._persist_settings)
+        self.rate_spin.bind("<Return>", self._persist_settings)
         Tooltip(self.rate_spin,
                 "Speaking rate in words per minute (local voices only). "
                 "Use Up/Down arrows to adjust.")
@@ -1085,18 +1189,32 @@ class TTSApp(tk.Tk):
         self._voice_entries = entries
         self.voice_combo["values"] = [e["label"] for e in entries]
 
-        if select_first_cloud and self._cloud.voices:
-            self.voice_combo.current(first_cloud_idx)
-        else:
-            # Pick a sensible local default on first load
-            preferred = ("zira", "david", "samantha", "alex")
-            default = next(
-                (i for i, e in enumerate(entries)
-                 if e["provider"] == "local"
-                 and any(p in e["label"].lower() for p in preferred)),
-                0,
-            )
-            self.voice_combo.current(default)
+        # Prefer restoring the saved voice. A saved cloud voice may not exist
+        # yet (cloud connects later); keep _pending_voice so a subsequent call
+        # after connection can still restore it.
+        restored = False
+        if self._pending_voice is not None:
+            want = self._pending_voice
+            for i, e in enumerate(entries):
+                if e["provider"] == want.provider and e["id"] == want.voice_id:
+                    self.voice_combo.current(i)
+                    self._pending_voice = None
+                    restored = True
+                    break
+
+        if not restored:
+            if select_first_cloud and self._cloud.voices:
+                self.voice_combo.current(first_cloud_idx)
+            else:
+                # Pick a sensible local default on first load
+                preferred = ("zira", "david", "samantha", "alex")
+                default = next(
+                    (i for i, e in enumerate(entries)
+                     if e["provider"] == "local"
+                     and any(p in e["label"].lower() for p in preferred)),
+                    0,
+                )
+                self.voice_combo.current(default)
 
         self._on_voice_change()
         local_n = sum(e["provider"] == "local" for e in entries)
@@ -1112,6 +1230,35 @@ class TTSApp(tk.Tk):
         """Rate only applies to local voices; grey it out for cloud voices."""
         is_cloud = self._selected_entry()["provider"] == "cloud"
         self.rate_spin.config(state="disabled" if is_cloud else "normal")
+
+    def _on_voice_selected(self, _event=None):
+        """User picked a voice: update state and remember the choice."""
+        self._on_voice_change()
+        self._persist_settings()
+
+    def _persist_settings(self, _event=None):
+        """Save the current voice/rate/announce choices to the INI file.
+
+        Called only for deliberate user changes, so the programmatic restore in
+        _populate_voices can't overwrite a not-yet-loaded cloud preference.
+        """
+        if not self._voice_entries:
+            return
+        entry = self._selected_entry()
+        try:
+            rate = int(self.rate_var.get())
+        except (tk.TclError, ValueError):
+            rate = DEFAULT_RATE
+        settings = VoiceSettings(
+            provider=entry["provider"],
+            voice_id=entry["id"],
+            rate=max(MIN_RATE, min(MAX_RATE, rate)),
+            announce=bool(self.announce_var.get()),
+        )
+        try:
+            save_voice_settings(settings)
+        except OSError:
+            pass  # best effort; don't disrupt the UI over a settings write
 
     # ── ElevenLabs connection ────────────────────────────────────────────────
 
@@ -1332,6 +1479,7 @@ class TTSApp(tk.Tk):
     def _on_announce_toggle(self):
         """Re-parse the currently loaded document with the new announce setting."""
         if not self._parsed:
+            self._persist_settings()  # still remember the preference
             return
         # Re-reading replaces the text box; don't silently discard any edits the
         # user made to the loaded document since it was parsed.
@@ -1345,6 +1493,7 @@ class TTSApp(tk.Tk):
             ):
                 self.announce_var.set(not self.announce_var.get())  # revert toggle
                 return
+        self._persist_settings()  # remember the new announce preference
         self._load_document_path(self._parsed.source)
 
     def _load_document_path(self, path: str):
@@ -1373,35 +1522,17 @@ class TTSApp(tk.Tk):
 
     def _play_file(self, path: str):
         """Play an audio file, blocking until it finishes or _stop() kills it."""
-        system = platform.system()
-        if system == "Darwin":
-            cmd = ["afplay", path]
-        elif system == "Windows":
-            # Default association handles mp3; play and return.
+        cmd = _audio_play_command(path)
+        if cmd is None:
+            # Windows: default association handles mp3; play and return.
             os.startfile(path)  # type: ignore[attr-defined]
             return
-        else:
-            player = self._first_available(["ffplay", "mpv", "cvlc", "xdg-open"])
-            if player is None:
-                raise RuntimeError(
-                    "No audio player found (install ffplay, mpv or vlc)."
-                )
-            cmd = (
-                [player, "-nodisp", "-autoexit", "-loglevel", "quiet", path]
-                if player == "ffplay"
-                else [player, path]
-            )
 
         self._play_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         self._play_proc.wait()
         self._play_proc = None
-
-    @staticmethod
-    def _first_available(candidates: list[str]) -> str | None:
-        from shutil import which
-        return next((c for c in candidates if which(c)), None)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -1446,8 +1577,231 @@ class TTSApp(tk.Tk):
             self.speak_btn.focus_set()
 
 
+# ── Headless / command-line mode ──────────────────────────────────────────────
+#
+# When any argument is passed, the app runs without a GUI: it speaks (or, with
+# -o/--output, saves) some text or a document using the voice settings saved by
+# the GUI. This makes the app scriptable, e.g.:
+#
+#     simple-speech-output "Hello there"
+#     simple-speech-output --file report.docx --no-announce
+#     simple-speech-output --file notes.md -o notes.wav
+#     echo "piped text" | simple-speech-output -
+#
+# Launching with no arguments opens the GUI, so piped input needs an explicit
+# "-" (or another flag) to select headless mode.
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="simple-speech-output",
+        description="Speak or save text/documents from the command line, "
+                    "using the voice settings saved by the GUI. Run with no "
+                    "arguments to open the graphical app.",
+    )
+    p.add_argument(
+        "text", nargs="?",
+        help="Text to speak, or a path to a .txt/.md/.docx file. Use '-' to "
+             "read the text from standard input; omit when using --file.",
+    )
+    p.add_argument("-f", "--file", metavar="PATH",
+                   help="Read the text from a .txt/.md/.docx file.")
+    p.add_argument("-o", "--output", metavar="PATH",
+                   help="Save the audio to this file instead of speaking aloud.")
+    p.add_argument("-v", "--voice", metavar="NAME",
+                   help="Voice id or (partial) name; overrides the saved voice.")
+    p.add_argument("-r", "--rate", type=int, metavar="WPM",
+                   help="Speaking rate for local voices (words per minute).")
+    p.add_argument("--provider", choices=("local", "cloud"),
+                   help="Force local or ElevenLabs cloud voices.")
+    grp = p.add_mutually_exclusive_group()
+    grp.add_argument("--announce", dest="announce", action="store_true",
+                     default=None, help="Announce document formatting.")
+    grp.add_argument("--no-announce", dest="announce", action="store_false",
+                     help="Read plain text only (no formatting announcements).")
+    p.add_argument("--list-voices", action="store_true",
+                   help="List the available voices and exit.")
+    return p
+
+
+def _looks_like_document(text: str) -> bool:
+    """True when a positional argument names an existing supported file."""
+    try:
+        path = Path(text).expanduser()
+        return path.is_file() and path.suffix.lower() in ALLOWED_EXTS
+    except (OSError, ValueError):
+        return False
+
+
+def _resolve_headless_text(args, announce: bool) -> str:
+    """Work out the text to speak from the CLI arguments / stdin."""
+    if args.file:
+        return load_document(args.file, announce=announce).spoken_text
+    if args.text == "-":  # explicit "read from stdin"
+        return _sanitize(_normalize_newlines(sys.stdin.read())).strip()
+    if args.text is not None:
+        if _looks_like_document(args.text):
+            return load_document(args.text, announce=announce).spoken_text
+        return _sanitize(_normalize_newlines(args.text)).strip()
+    # No positional text: fall back to stdin when it's piped (e.g. combined
+    # with -o), otherwise there's nothing to say.
+    if not sys.stdin.isatty():
+        return _sanitize(_normalize_newlines(sys.stdin.read())).strip()
+    raise DocumentError("No text given. Provide text, '-', --file PATH, or "
+                        "pipe input on stdin.")
+
+
+def _match_local_voice(voices, want: str | None, saved_id: str) -> str | None:
+    """Pick a pyttsx3 voice id: --voice, else the saved one, else the first."""
+    catalogue = [(v.id, (v.name or v.id)) for v in voices]
+    if want:
+        wl = want.lower()
+        for vid, name in catalogue:
+            if vid == want or wl in vid.lower() or wl in name.lower():
+                return vid
+        return None
+    if saved_id:
+        for vid, _name in catalogue:
+            if vid == saved_id:
+                return vid
+    return catalogue[0][0] if catalogue else None
+
+
+def _match_cloud_voice(voices, want: str | None, saved_id: str) -> str | None:
+    """Pick an ElevenLabs voice id: --voice, else the saved one, else the first."""
+    if want:
+        wl = want.lower()
+        for vid, name in voices:
+            if vid == want or wl in name.lower():
+                return vid
+        return None
+    for vid, _name in voices:
+        if vid == saved_id:
+            return vid
+    return voices[0][0] if voices else None
+
+
+def _list_voices() -> int:
+    print("Local voices:")
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        for v in (engine.getProperty("voices") or []):
+            print(f"  [local] {v.id}\t{v.name or ''}")
+    except Exception as exc:  # noqa: BLE001 - report and continue
+        print(f"  (could not list local voices: {exc})")
+
+    key = load_api_key()
+    if key:
+        print("\nCloud voices (ElevenLabs):")
+        try:
+            cloud = CloudTTS()
+            cloud.connect(key)
+            for vid, name in cloud.voices:
+                print(f"  [cloud] {vid}\t{name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (could not list cloud voices: {exc})")
+    return 0
+
+
+def _speak_local(engine, text: str, voice_id: str, rate: int,
+                 output: str | None) -> int:
+    engine.setProperty("voice", voice_id)
+    engine.setProperty("rate", rate)
+    if output:
+        engine.save_to_file(text, output)
+    else:
+        engine.say(text)
+    engine.runAndWait()
+    return 0
+
+
+def _speak_cloud(text: str, voice_id: str, output: str | None,
+                 cloud: CloudTTS) -> int:
+    audio = cloud.synthesize(text, voice_id, "mp3_44100_128")
+    if output:
+        Path(output).write_bytes(audio)
+        return 0
+    fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="eltts_")
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(audio)
+        _play_audio_blocking(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return 0
+
+
+def run_headless(argv: list[str]) -> int:
+    args = _build_arg_parser().parse_args(argv)
+
+    if args.list_voices:
+        return _list_voices()
+
+    settings = load_voice_settings()
+    provider = args.provider or settings.provider
+    rate = args.rate if args.rate is not None else settings.rate
+    rate = max(MIN_RATE, min(MAX_RATE, rate))
+    announce = settings.announce if args.announce is None else args.announce
+
+    try:
+        text = _resolve_headless_text(args, announce)
+    except DocumentError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    if not text:
+        print("Error: nothing to speak (the text was empty).", file=sys.stderr)
+        return 2
+
+    if provider == "cloud":
+        key = load_api_key()
+        if not key:
+            print("Error: no ElevenLabs API key saved. Connect once in the "
+                  "GUI, or use --provider local.", file=sys.stderr)
+            return 2
+        cloud = CloudTTS()
+        try:
+            cloud.connect(key)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error: ElevenLabs connection failed: {exc}", file=sys.stderr)
+            return 2
+        voice_id = _match_cloud_voice(cloud.voices, args.voice, settings.voice_id)
+        if voice_id is None:
+            print("Error: no matching cloud voice found.", file=sys.stderr)
+            return 2
+        try:
+            return _speak_cloud(text, voice_id, args.output, cloud)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+    # Local (default)
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        voices = list(engine.getProperty("voices") or [])
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: could not initialise local voices: {exc}", file=sys.stderr)
+        return 1
+    voice_id = _match_local_voice(voices, args.voice, settings.voice_id)
+    if voice_id is None:
+        print("Error: no matching local voice found "
+              "(try --list-voices).", file=sys.stderr)
+        return 2
+    try:
+        return _speak_local(engine, text, voice_id, rate, args.output)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        sys.exit(run_headless(sys.argv[1:]))
     app = TTSApp()
     app.mainloop()
