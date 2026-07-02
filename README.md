@@ -447,6 +447,23 @@ Run `dist\TextToSpeech.exe` on a **clean** Windows machine (one without Python) 
 
 The same `pyinstaller --onefile --windowed ...` command works on **macOS** (produces a `.app`/Unix binary) and **Linux** (produces an ELF binary). Each must be built on its own OS.
 
+### Automated builds & releases (GitHub Actions)
+
+The repository ships a workflow at [`.github/workflows/build-release.yml`](.github/workflows/build-release.yml) that builds all three platforms on GitHub's runners (no local toolchain needed):
+
+- **Every push to `main` and every pull request** builds Linux, macOS, and Windows bundles to catch breakage. The artifacts are attached to the workflow run (Actions tab → the run → *Artifacts*).
+- **Pushing a version tag** builds all three and publishes a **GitHub Release** with the archives attached:
+
+  ```bash
+  git tag v1.0.0
+  git push origin v1.0.0
+  ```
+
+  Release assets: `SimpleSpeechOutput-linux.tar.gz`, `SimpleSpeechOutput-macos.zip` (a `.app` bundle), and `SimpleSpeechOutput-windows.zip`.
+- **Run workflow** in the Actions tab builds on demand without cutting a release.
+
+> macOS builds use PyInstaller's onedir `.app` bundle (Linux/Windows use `--onefile`). The macOS app is **unsigned**, so on first launch users may need to right-click → **Open**, or clear the quarantine flag with `xattr -dr com.apple.quarantine SimpleSpeechOutput.app`.
+
 ---
 
 ## Troubleshooting

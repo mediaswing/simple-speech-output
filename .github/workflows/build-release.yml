@@ -1,0 +1,110 @@
+name: Build & Release
+
+# Builds standalone PyInstaller bundles for Linux, macOS and Windows.
+#
+#  * Every push to main and every PR: build all three to catch breakage.
+#  * Pushing a version tag (e.g. `v1.2.0`): build all three, then publish a
+#    GitHub Release with the three archives attached.
+#  * "Run workflow" in the Actions tab: build on demand (no release).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: SimpleSpeechOutput-linux.tar.gz
+            # onefile → a single distributable binary
+            mode: "--onefile"
+          - os: macos-latest
+            asset: SimpleSpeechOutput-macos.zip
+            # onedir → a proper .app bundle (onefile+windowed is deprecated
+            # on macOS and errors in PyInstaller v7)
+            mode: ""
+          - os: windows-latest
+            asset: SimpleSpeechOutput-windows.zip
+            # onefile → a single distributable .exe
+            mode: "--onefile"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyttsx3 elevenlabs pyinstaller
+
+      - name: Build with PyInstaller
+        run: >
+          pyinstaller ${{ matrix.mode }} --windowed --name SimpleSpeechOutput
+          --hidden-import pyttsx3.drivers.sapi5
+          --hidden-import pyttsx3.drivers.nsss
+          --hidden-import pyttsx3.drivers.espeak
+          --hidden-import xml.etree.ElementTree
+          --collect-all elevenlabs
+          simple-speech-output.py
+
+      # Package one archive per OS. macOS + Linux keep the executable bit via
+      # tar/zip; Windows ships the .exe.
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar -C dist -czf "${{ matrix.asset }}" SimpleSpeechOutput
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          # --onefile --windowed produces a .app bundle; ship that.
+          ditto -c -k --sequesterRsrc --keepParent \
+            "SimpleSpeechOutput.app" "../${{ matrix.asset }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/SimpleSpeechOutput.exe -DestinationPath "${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create the release and upload assets
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
