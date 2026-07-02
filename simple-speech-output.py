@@ -265,6 +265,15 @@ def _parse_markdown(raw: str, announce: bool) -> str:
         out.append(_inline_md(line, announce))
         i += 1
 
+    # An unterminated code fence: emit what we buffered rather than dropping it.
+    if in_fence and code:
+        if announce:
+            out.append(f"Code block in {fence_lang}."
+                       if fence_lang else "Code block.")
+        out.extend(code)
+        if announce:
+            out.append("End of code block.")
+
     return "\n".join(out)
 
 
@@ -368,6 +377,29 @@ def _docx_table(tbl, announce: bool) -> list[str]:
     return out
 
 
+def _decode_xml(data: bytes) -> str:
+    """Decode raw XML bytes to text, honouring a BOM or encoding declaration.
+
+    A byte-level scan for a DTD is encoding-fragile (e.g. a UTF-16 document.xml
+    encodes "<!ENTITY" with interleaved NUL bytes and slips past an ASCII
+    substring test). Decoding first lets the DTD guard work regardless of the
+    encoding a crafted file chose.
+    """
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", errors="replace")
+    if data.startswith((b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")):
+        return data.decode("utf-32", errors="replace")
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    m = re.match(rb"^\s*<\?xml[^>]*encoding=[\"']([\w.\-]+)[\"']", data)
+    if m:
+        try:
+            return data.decode(m.group(1).decode("ascii"), errors="replace")
+        except LookupError:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
 def _parse_docx(path: Path, announce: bool) -> str:
     try:
         with zipfile.ZipFile(path) as z:
@@ -386,7 +418,11 @@ def _parse_docx(path: Path, announce: bool) -> str:
     if len(data) > MAX_UNCOMPRESSED:
         raise DocumentError("Document is too large to open safely.")
     # A genuine document.xml has no DTD; refuse one to block XXE / entity bombs.
-    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+    # Scan the decoded text so the guard holds for any XML encoding, not just
+    # UTF-8 (a UTF-16 payload would hide "<!ENTITY" from a raw byte scan).
+    decoded = _decode_xml(data)
+    lowered = decoded.lower()
+    if "<!doctype" in lowered or "<!entity" in lowered:
         raise DocumentError("Document contains disallowed XML declarations.")
 
     try:
@@ -1295,8 +1331,21 @@ class TTSApp(tk.Tk):
 
     def _on_announce_toggle(self):
         """Re-parse the currently loaded document with the new announce setting."""
-        if self._parsed:
-            self._load_document_path(self._parsed.source)
+        if not self._parsed:
+            return
+        # Re-reading replaces the text box; don't silently discard any edits the
+        # user made to the loaded document since it was parsed.
+        current = self.text_box.get("1.0", "end-1c")
+        if current.strip() and current != self._parsed.spoken_text:
+            if not messagebox.askyesno(
+                "Reload document",
+                "Re-reading the document will replace your current edits in "
+                "the text box.\n\nReload and discard those edits?",
+                default="no",
+            ):
+                self.announce_var.set(not self.announce_var.get())  # revert toggle
+                return
+        self._load_document_path(self._parsed.source)
 
     def _load_document_path(self, path: str):
         """Parse *path* (honouring the announce toggle) into the text box."""
